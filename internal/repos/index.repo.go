@@ -6,8 +6,7 @@ import (
 )
 
 type MainRepo interface {
-	GetUserTransactionWithinTimeframe(ctx context.Context, userID int64) ([]gen.GetUserTransactionsWithinTimeframeRow, error)
-	GetUserTransactions(ctx context.Context, userID int64) ([]gen.Transaction, error)
+	GetRecentTransactions(ctx context.Context, limit int32) ([]gen.Transaction, error)
 }
 
 type MainRepoImpl struct {
@@ -20,10 +19,6 @@ func InitMainRepo(repo *gen.Queries) *MainRepoImpl {
 	}
 }
 
-func (r *MainRepoImpl) GetUserTransactions(ctx context.Context, userID int64) ([]gen.Transaction, error) {
-	return r.repo.GetUserTransactions(ctx, userID)
-}
-
-func (r *MainRepoImpl) GetUserTransactionWithinTimeframe(ctx context.Context, userID int64) ([]gen.GetUserTransactionsWithinTimeframeRow, error) {
-	return r.repo.GetUserTransactionsWithinTimeframe(ctx, userID)
+func (r *MainRepoImpl) GetRecentTransactions(ctx context.Context, limit int32) ([]gen.Transaction, error) {
+	return r.repo.GetRecentTransactions(ctx, limit)
 }

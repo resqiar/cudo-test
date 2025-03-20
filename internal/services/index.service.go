@@ -2,222 +2,452 @@ package services
 
 import (
 	"context"
+	"cudo-test/gen"
 	"cudo-test/internal/repos"
-	"log"
+	"fmt"
 	"math"
 	"sync"
+	"time"
 )
-
-type MainService interface {
-	DetectFraud(userID int64) *FraudResult
-}
 
 type MainServiceImpl struct {
 	mainRepo repos.MainRepo
 }
 
 type FraudResult struct {
-	FrequencyScore float64
-	AmountScore    float64
-	PatternScore   float64
-	FinalScore     float64
-	RiskLevel      string
+	TransactionID    string                 `json:"transaction_id"`
+	FraudScore       float64                `json:"fraud_score"`
+	RiskLevel        string                 `json:"risk_level"`
+	DetectionResults map[string]interface{} `json:"detection_results"`
+}
+
+type BatchResult struct {
+	Transactions   []FraudResult          `json:"transactions"`
+	ProcessingMeta map[string]interface{} `json:"processing_metadata"`
+}
+
+type CheckResult struct {
+	Result   map[string]interface{}
+	Duration time.Duration
+}
+
+type CheckDurations struct {
+	FreqDuration    time.Duration
+	AmountDuration  time.Duration
+	PatternDuration time.Duration
+}
+
+type ProcessingResult struct {
+	FraudResult FraudResult
+	Durations   CheckDurations
+}
+
+type MainService interface {
+	DetectFraud(limit int32, riskLevels []string) (BatchResult, error)
 }
 
 func InitMainService(mainRepo repos.MainRepo) *MainServiceImpl {
-	return &MainServiceImpl{
-		mainRepo: mainRepo,
-	}
+	return &MainServiceImpl{mainRepo: mainRepo}
 }
 
-// DetectFraud performs fraud detection by running multiple risk assessment checks
-// (Frequency, Amount, and Pattern checks) in parallel. It then aggregates the results
-// to compute a final fraud score and determine the user's risk level.
+const (
+	HighRiskScoreThreshold       = 80.0
+	MediumRiskScoreThreshold     = 50.0
+	FrequencyHighThreshold       = 8
+	FrequencyMediumHighThreshold = 7
+	FrequencyMediumThreshold     = 6
+	FrequencyLowThreshold        = 5
+	PatternSpikeThreshold        = 300.0 // percentage increase
+)
+
+// DetectFraud analyzes recent transactions for potential fraud.
 //
-// 1. Runs each check in a separate goroutine for performance.
-// 2. Aggregates the results once all checks are completed.
-// 3. Computes a weighted final score based on the results.
-// 4. Assigns a risk level based on the final fraud score.
-func (s *MainServiceImpl) DetectFraud(userID int64) *FraudResult {
+// It fetches recent transactions, groups them by user, and processes each transaction
+// in parallel using goroutines.
+//
+// For each transaction, it performs three checks:
+// frequency, amount, and pattern analysis. The results are combined into a fraud score,
+// and transactions are filtered by specified risk levels. Processing metadata, including
+// average check durations, is included in the response.
+func (s *MainServiceImpl) DetectFraud(limit int32, riskLevels []string) (BatchResult, error) {
+	startTime := time.Now()
+
+	// Fetch recent transactions
+	transactions, err := s.mainRepo.GetRecentTransactions(context.Background(), limit)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("failed to fetch transactions: %v", err)
+	}
+
+	// Group transactions by user ID for efficient lookup during checks
+	userTransactionsMap := make(map[int64][]gen.Transaction)
+	for _, tx := range transactions {
+		userTransactionsMap[tx.UserID] = append(userTransactionsMap[tx.UserID], tx)
+	}
+
 	var wg sync.WaitGroup
+	processingResultsChan := make(chan ProcessingResult, len(transactions))
 
-	resultChan := make(chan FraudResult, 3)
-	ctx := context.Background()
-	wg.Add(3)
+	// Process each transaction in parallel
+	for _, tx := range transactions {
+		wg.Add(1)
+		go func(tx gen.Transaction) {
+			defer wg.Done()
 
-	// frequency check
-	go func() {
-		defer wg.Done()
-		freqScore := s.frequencyCheck(ctx, userID)
-		resultChan <- FraudResult{FrequencyScore: freqScore}
-	}()
+			var checkWg sync.WaitGroup
+			checkWg.Add(3)
 
-	// amount check
-	go func() {
-		defer wg.Done()
-		amountScore := s.amountCheck(ctx, userID)
-		resultChan <- FraudResult{AmountScore: amountScore}
-	}()
+			// Variables to store results from parallel checks
+			var freqRes, amountRes, patternRes CheckResult
 
-	// pattern check
-	go func() {
-		defer wg.Done()
-		patternScore := s.patternCheck(ctx, userID)
-		resultChan <- FraudResult{PatternScore: patternScore}
-	}()
+			// Freq Check
+			go func() {
+				defer checkWg.Done()
+				freqRes = s.frequencyCheck(tx, userTransactionsMap[tx.UserID])
+			}()
+
+			// Amount Check
+			go func() {
+				defer checkWg.Done()
+				amountRes = s.amountCheck(tx, userTransactionsMap[tx.UserID])
+			}()
+
+			// Pattern Check
+			go func() {
+				defer checkWg.Done()
+				patternRes = s.patternCheck(tx, userTransactionsMap[tx.UserID])
+			}()
+
+			checkWg.Wait()
+
+			freqResult := freqRes.Result
+			amountResult := amountRes.Result
+			patternResult := patternRes.Result
+
+			// Calculate weighted fraud score
+			freqScore := freqResult["confidence_score"].(float64)
+			amountScore := amountResult["confidence_score"].(float64)
+			patternScore := patternResult["confidence_score"].(float64)
+			finalScore := (freqScore * 0.4) + (amountScore * 0.3) + (patternScore * 0.3)
+
+			// Determine risk level based on => final score
+			var riskLevel string
+			switch {
+			case finalScore > 80:
+				riskLevel = "high"
+			case finalScore >= 50:
+				riskLevel = "medium"
+			default:
+				riskLevel = "low"
+			}
+
+			detectionResults := map[string]interface{}{
+				"frequency_check": freqResult,
+				"amount_check":    amountResult,
+				"pattern_check":   patternResult,
+			}
+
+			processingResult := ProcessingResult{
+				FraudResult: FraudResult{
+					TransactionID:    tx.OrderID,
+					FraudScore:       finalScore,
+					RiskLevel:        riskLevel,
+					DetectionResults: detectionResults,
+				},
+				Durations: CheckDurations{
+					FreqDuration:    freqRes.Duration,
+					AmountDuration:  amountRes.Duration,
+					PatternDuration: patternRes.Duration,
+				},
+			}
+
+			processingResultsChan <- processingResult
+		}(tx)
+	}
 
 	wg.Wait()
-	close(resultChan)
+	close(processingResultsChan)
 
-	finalResult := FraudResult{}
-	for res := range resultChan {
-		finalResult.FrequencyScore += res.FrequencyScore
-		finalResult.AmountScore += res.AmountScore
-		finalResult.PatternScore += res.PatternScore
+	// Collect all processing results
+	var processingResults []ProcessingResult
+	for pr := range processingResultsChan {
+		processingResults = append(processingResults, pr)
 	}
 
-	// Compute the final fraud score using weighted contributions:
-	// - Frequency Score: 40% weight
-	// - Amount Score: 30% weight
-	// - Pattern Score: 30% weight
-	finalResult.FinalScore = (finalResult.FrequencyScore * 0.4) +
-		(finalResult.AmountScore * 0.3) +
-		(finalResult.PatternScore * 0.3)
-
-	// Assign a risk level based on the final score:
-	// - High risk: Score > 80
-	// - Medium risk: Score between 50 and 80
-	// - Low risk: Score < 50
-	switch {
-	case finalResult.FinalScore > 80:
-		finalResult.RiskLevel = "High"
-	case finalResult.FinalScore >= 50:
-		finalResult.RiskLevel = "Medium"
-	default:
-		finalResult.RiskLevel = "Low"
+	// Filter results by specified risk levels
+	var filteredResults []FraudResult
+	for _, pr := range processingResults {
+		if len(riskLevels) == 0 || contains(riskLevels, pr.FraudResult.RiskLevel) {
+			filteredResults = append(filteredResults, pr.FraudResult)
+		}
 	}
 
-	return &finalResult
+	// Calculate total and average durations for metadata
+	var totalFreqDuration, totalAmountDuration, totalPatternDuration time.Duration
+	for _, pr := range processingResults {
+		totalFreqDuration += pr.Durations.FreqDuration
+		totalAmountDuration += pr.Durations.AmountDuration
+		totalPatternDuration += pr.Durations.PatternDuration
+	}
+
+	numTransactions := int64(len(processingResults))
+	var processingMeta map[string]interface{}
+
+	if numTransactions > 0 {
+		avgFreqDuration := totalFreqDuration / time.Duration(numTransactions)
+		avgAmountDuration := totalAmountDuration / time.Duration(numTransactions)
+		avgPatternDuration := totalPatternDuration / time.Duration(numTransactions)
+		totalDuration := time.Since(startTime)
+
+		processingMeta = map[string]interface{}{
+			"total_transactions_analyzed": len(transactions),
+			"duration_ms":                 totalDuration.Milliseconds(),
+			"parallel_tasks": map[string]int64{
+				"frequency_analysis_duration_ms": avgFreqDuration.Milliseconds(),
+				"amount_analysis_duration_ms":    avgAmountDuration.Milliseconds(),
+				"pattern_analysis_duration_ms":   avgPatternDuration.Milliseconds(),
+			},
+		}
+	} else {
+		processingMeta = map[string]interface{}{
+			"total_transactions_analyzed": 0,
+			"duration_ms":                 0,
+			"parallel_tasks":              map[string]int64{},
+		}
+	}
+
+	return BatchResult{
+		Transactions:   filteredResults,
+		ProcessingMeta: processingMeta,
+	}, nil
 }
 
-// calculates a risk score based on the number of transactions
-// a user has made within a specific timeframe.
+// frequencyCheck analyzes transaction frequency within a one hour time window.
 //
-// - If transactions exceed 8, return 95 (high risk).
-// - If transactions exceed 7, return 85.
-// - If transactions exceed 6, return 75.
-// - If transactions exceed 5, return 60.
-// - Otherwise, return transaction count * 10 as a percentage.
-func (s *MainServiceImpl) frequencyCheck(ctx context.Context, userID int64) float64 {
-	transactions, err := s.mainRepo.GetUserTransactionWithinTimeframe(ctx, userID)
-	if err != nil {
-		log.Printf("Frequency check error: %v", err)
-		return 0
+// It counts transactions by the same user within one hour of the current transaction
+// and assigns a confidence_score based on predefined thresholds.
+// Transactions exceeding a frequency threshold are flagged as sus.
+func (s *MainServiceImpl) frequencyCheck(tx gen.Transaction, userTxs []gen.Transaction) CheckResult {
+	start := time.Now()
+
+	count := int64(0)
+	for _, t := range userTxs {
+		if t.TransactionDate.Time.Sub(tx.TransactionDate.Time).Abs() <= time.Hour {
+			count++
+		}
 	}
 
-	if len(transactions) == 0 {
-		return 0
-	}
-
-	transacCount := transactions[0].TransacCount
-
+	// Assign confidence score based on transaction count
+	var score float64
 	switch {
-	case transacCount > 8:
-		return 95
-	case transacCount > 7:
-		return 85
-	case transacCount > 6:
-		return 75
-	case transacCount > 5:
-		return 60
+	case count > FrequencyHighThreshold:
+		score = 95
+	case count > FrequencyMediumHighThreshold:
+		score = 85
+	case count > FrequencyMediumThreshold:
+		score = 75
+	case count > FrequencyLowThreshold:
+		score = 60
 	default:
-		return float64(transacCount) * 10
+		score = float64(count) * 10
 	}
+
+	isSuspicious := count > FrequencyLowThreshold
+	triggers := []string{}
+
+	if isSuspicious {
+		triggers = append(triggers, fmt.Sprintf("high order frequency: %d orders in 1 hour", count))
+	}
+
+	result := map[string]interface{}{
+		"is_suspicious":    isSuspicious,
+		"confidence_score": score,
+		"triggers":         triggers,
+	}
+
+	return CheckResult{Result: result, Duration: time.Since(start)}
 }
 
-// calculates a risk score based on the transaction amount pattern.
+// amountCheck performs statistical analysis on transaction amounts.
 //
-// 1. Compute the mean and standard deviation of all transactions.
-// 2. Calculate the Z-score for the latest transaction to detect anomalies.
-// 3. Normalize the score between 0-100 for risk assessment.
-func (s *MainServiceImpl) amountCheck(ctx context.Context, userID int64) float64 {
-	txs, err := s.mainRepo.GetUserTransactions(ctx, userID)
-	if err != nil {
-		log.Printf("Amount check error: %v", err)
-		return 0
+// It calculates the mean and standard deviation of historical amounts and computes
+// a Z-score for the current transaction. A high Z-score indicates an unusual amount,
+// triggering a suspicious flag and confidence score.
+func (s *MainServiceImpl) amountCheck(tx gen.Transaction, userTxs []gen.Transaction) CheckResult {
+	start := time.Now()
+
+	// collect historical transaction amounts
+	var historicalTxs []float64
+	for _, t := range userTxs {
+		// skip current tx
+		if t.ID == tx.ID {
+			continue
+		}
+
+		amt, err := t.Amount.Float64Value()
+		if err != nil {
+			continue
+		}
+
+		historicalTxs = append(historicalTxs, amt.Float64)
 	}
 
-	if len(txs) == 0 {
-		return 0
+	// Handle insufficient data
+	// if not handled, it could lead to NaN which i painfully debug for hours :(
+	if len(historicalTxs) < 2 {
+		result := map[string]interface{}{
+			"is_suspicious":    false,
+			"confidence_score": 0.0,
+			"triggers":         []string{},
+		}
+
+		return CheckResult{Result: result, Duration: time.Since(start)}
 	}
 
+	// Calculate mean and standard deviation
 	var sum, sumSquared float64
 
-	// calculate sum and squared sum
-	for _, tx := range txs {
-		// this is type cast from SQLC,
-		// a bit pain but have to be done
-		amt, _ := tx.Amount.Float64Value()
-		sum += amt.Float64
-		sumSquared += amt.Float64 * amt.Float64
+	for _, amt := range historicalTxs {
+		sum += amt
+		sumSquared += amt * amt
 	}
 
-	// determine mean and std
-	n := float64(len(txs))
-	mean := sum / n
-	variance := (sumSquared / n) - (mean * mean)
+	mean := sum / float64(len(historicalTxs))
+	variance := (sumSquared / float64(len(historicalTxs))) - (mean * mean)
 	stdDev := math.Sqrt(variance)
 
-	// prevent division by 0
-	if stdDev == 0 {
-		return 0
+	// Get current transaction amount
+	currentAmt, err := tx.Amount.Float64Value()
+	if err != nil {
+		result := map[string]interface{}{
+			"is_suspicious":    false,
+			"confidence_score": 0.0,
+			"triggers":         []string{"invalid amount"},
+		}
+		return CheckResult{Result: result, Duration: time.Since(start)}
 	}
 
-	// this is type cast from SQLC,
-	// a bit pain but have to be done
-	latestAmount, _ := txs[0].Amount.Float64Value()
+	currentAmount := currentAmt.Float64
 
-	// z-score to determine how far latest transaction deviates from the mean
-	zScore := (latestAmount.Float64 - mean) / stdDev
+	// Handle zero standard deviation
+	var score float64
+	var isSuspicious bool
+	var triggers []string
 
-	// normalize score between 0-100
-	// higher deviation means higher risk
-	return math.Min(100, math.Max(0, (zScore-2)*20))
+	// Effectively zero deviation
+	if stdDev < 1e-6 {
+		if currentAmount > mean {
+			score = 100.0
+			isSuspicious = true
+			triggers = append(triggers, "unusual amount: deviates from uniform historical amounts")
+		} else {
+			score = 0.0
+			isSuspicious = false
+		}
+	} else {
+		zScore := (currentAmount - mean) / stdDev
+		score = math.Min(100, math.Max(0, (zScore-2)*20))
+		isSuspicious = zScore > 2
+
+		if isSuspicious {
+			triggers = append(triggers, fmt.Sprintf("unusual amount: Z-score %.2f", zScore))
+		}
+	}
+
+	result := map[string]interface{}{
+		"is_suspicious":    isSuspicious,
+		"confidence_score": score,
+		"triggers":         triggers,
+	}
+
+	return CheckResult{Result: result, Duration: time.Since(start)}
 }
 
-// detects unusual transaction behavior by comparing the latest transaction amount
-// against historical averages.
+// patternCheck detects significant increases in transaction amounts.
 //
-// 1. Calculate the baseline average amount from past transactions (excluding the latest).
-// 2. Compare the latest transaction to this baseline and determine the percentage increase.
-// 3. Normalize the result to a 0-100 risk score.
-func (s *MainServiceImpl) patternCheck(ctx context.Context, userID int64) float64 {
-	txs, err := s.mainRepo.GetUserTransactions(ctx, userID)
+// It computes the average of historical amounts and calculates the percentage increase
+// of the current transaction. A large increase triggers a suspicious flag and a
+// confidence score proportional to the spike.
+func (s *MainServiceImpl) patternCheck(tx gen.Transaction, userTxs []gen.Transaction) CheckResult {
+	start := time.Now()
+
+	// Collect historical transaction amounts
+	var historicalTxs []float64
+	for _, t := range userTxs {
+		if t.ID == tx.ID {
+			continue
+		}
+
+		amt, err := t.Amount.Float64Value()
+		// Skip if amount is null
+		if err != nil {
+			continue
+		}
+
+		historicalTxs = append(historicalTxs, amt.Float64)
+	}
+
+	// Handle insufficient data
+	if len(historicalTxs) == 0 {
+		result := map[string]interface{}{
+			"is_suspicious":    false,
+			"confidence_score": 0.0,
+			"triggers":         []string{},
+		}
+
+		return CheckResult{Result: result, Duration: time.Since(start)}
+	}
+
+	// Calculate baseline
+	var sum float64
+	for _, amt := range historicalTxs {
+		sum += amt
+	}
+
+	baseline := sum / float64(len(historicalTxs))
+
+	currentAmt, err := tx.Amount.Float64Value()
 	if err != nil {
-		log.Printf("Pattern check error: %v", err)
-		return 0
+		result := map[string]interface{}{
+			"is_suspicious":    false,
+			"confidence_score": 0.0,
+			"triggers":         []string{"invalid amount"},
+		}
+
+		return CheckResult{Result: result, Duration: time.Since(start)}
 	}
 
-	// need at least 2 transactions to compare patterns
-	if len(txs) < 2 {
-		return 0
+	currentAmount := currentAmt.Float64
+
+	// Calculate percentage increase
+	var percentIncrease float64
+	if baseline > 0 { // Avoid division by zero
+		percentIncrease = ((currentAmount - baseline) / baseline) * 100
 	}
 
-	// compute baseline average from all past transactions (excluding latest)
-	var baselineSum float64
-	for i := 1; i < len(txs); i++ {
-		amt, _ := txs[i].Amount.Float64Value()
-		baselineSum += amt.Float64
+	// Calculate confidence score
+	score := math.Min(100, percentIncrease/4)
+	isSuspicious := percentIncrease > 300
+	triggers := []string{}
+
+	if isSuspicious {
+		triggers = append(triggers, fmt.Sprintf("spike in spending: %.0f%% increase", percentIncrease))
 	}
-	baseline := baselineSum / float64(len(txs)-1)
 
-	// get latest transaction amount
-	latestAmount, _ := txs[0].Amount.Float64Value()
+	result := map[string]interface{}{
+		"is_suspicious":    isSuspicious,
+		"confidence_score": score,
+		"triggers":         triggers,
+	}
 
-	// calculate percentage increase from baseline
-	percentIncrease := ((latestAmount.Float64 - baseline) / baseline) * 100
+	return CheckResult{Result: result, Duration: time.Since(start)}
+}
 
-	score := percentIncrease / 4
-
-	return math.Max(0, math.Min(100, score))
+// js inspired contains
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }

@@ -7,19 +7,17 @@ package gen
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getUserTransactions = `-- name: GetUserTransactions :many
-SELECT id, user_id, order_id, transaction_date, amount, payment_method, status, created_at, updated_at FROM transactions
-WHERE user_id = $1
+const getRecentTransactions = `-- name: GetRecentTransactions :many
+SELECT id, user_id, order_id, transaction_date, amount, payment_method, status, created_at, updated_at
+FROM transactions
 ORDER BY transaction_date DESC
-LIMIT 100
+LIMIT $1
 `
 
-func (q *Queries) GetUserTransactions(ctx context.Context, userID int64) ([]Transaction, error) {
-	rows, err := q.db.Query(ctx, getUserTransactions, userID)
+func (q *Queries) GetRecentTransactions(ctx context.Context, limit int32) ([]Transaction, error) {
+	rows, err := q.db.Query(ctx, getRecentTransactions, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -38,43 +36,6 @@ func (q *Queries) GetUserTransactions(ctx context.Context, userID int64) ([]Tran
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const getUserTransactionsWithinTimeframe = `-- name: GetUserTransactionsWithinTimeframe :many
-SELECT 
-    DATE_TRUNC('hour', transaction_date)::timestamp AS transac_hour,
-    user_id,
-    COUNT(*) AS transac_count
-FROM transactions
-WHERE user_id = $1
-GROUP BY transac_hour, user_id
-ORDER BY transac_hour DESC
-`
-
-type GetUserTransactionsWithinTimeframeRow struct {
-	TransacHour  pgtype.Timestamp
-	UserID       int64
-	TransacCount int64
-}
-
-func (q *Queries) GetUserTransactionsWithinTimeframe(ctx context.Context, userID int64) ([]GetUserTransactionsWithinTimeframeRow, error) {
-	rows, err := q.db.Query(ctx, getUserTransactionsWithinTimeframe, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []GetUserTransactionsWithinTimeframeRow
-	for rows.Next() {
-		var i GetUserTransactionsWithinTimeframeRow
-		if err := rows.Scan(&i.TransacHour, &i.UserID, &i.TransacCount); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
