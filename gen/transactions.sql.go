@@ -11,12 +11,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getTransactions = `-- name: GetTransactions :many
+const getUserTransactions = `-- name: GetUserTransactions :many
 SELECT id, user_id, order_id, transaction_date, amount, payment_method, status, created_at, updated_at FROM transactions
+WHERE user_id = $1
+ORDER BY transaction_date DESC
+LIMIT 100
 `
 
-func (q *Queries) GetTransactions(ctx context.Context) ([]Transaction, error) {
-	rows, err := q.db.Query(ctx, getTransactions)
+func (q *Queries) GetUserTransactions(ctx context.Context, userID int64) ([]Transaction, error) {
+	rows, err := q.db.Query(ctx, getUserTransactions, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -47,23 +50,23 @@ func (q *Queries) GetTransactions(ctx context.Context) ([]Transaction, error) {
 
 const getUserTransactionsWithinTimeframe = `-- name: GetUserTransactionsWithinTimeframe :many
 SELECT 
-    DATE_TRUNC('hour', transaction_date) AS transac_hour,
+    DATE_TRUNC('hour', transaction_date)::timestamp AS transac_hour,
     user_id,
     COUNT(*) AS transac_count
 FROM transactions
+WHERE user_id = $1
 GROUP BY transac_hour, user_id
-ORDER BY transac_hour DESC, transac_count DESC
-LIMIT 10000
+ORDER BY transac_hour DESC
 `
 
 type GetUserTransactionsWithinTimeframeRow struct {
-	TransacHour  pgtype.Interval
+	TransacHour  pgtype.Timestamp
 	UserID       int64
 	TransacCount int64
 }
 
-func (q *Queries) GetUserTransactionsWithinTimeframe(ctx context.Context) ([]GetUserTransactionsWithinTimeframeRow, error) {
-	rows, err := q.db.Query(ctx, getUserTransactionsWithinTimeframe)
+func (q *Queries) GetUserTransactionsWithinTimeframe(ctx context.Context, userID int64) ([]GetUserTransactionsWithinTimeframeRow, error) {
+	rows, err := q.db.Query(ctx, getUserTransactionsWithinTimeframe, userID)
 	if err != nil {
 		return nil, err
 	}
